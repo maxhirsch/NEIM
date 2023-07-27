@@ -189,7 +189,8 @@ def visualize(points, Q1, Q2, r, num_interior_points, Nt, every=10):
             plt.clf()
             plt.tick_params(axis='both', which='both', bottom='off', top='off', labelbottom='off', right='off', left='off', labelleft='off')
             plt.quiver(points[:, 0], points[:, 1], director2x[t], director2y[t], headaxislength=0, headwidth=0, headlength=0, color='b', pivot='mid')
-            plt.pause(0.0001)
+            plt.pause(0.4)
+            #plt.show()
     
     plt.show()
 

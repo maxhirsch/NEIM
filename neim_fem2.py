@@ -4,6 +4,7 @@ import torch.nn as nn
 import scipy.linalg as la
 from scipy import interpolate
 from tqdm import tqdm
+import time
 
 from other_functions import *
 
@@ -13,31 +14,59 @@ def weighted_mse_loss(input, target, weight):
 class Net(nn.Module):
     def __init__(self, in_size, out_size):
         super(Net, self).__init__()
-        self.fc1 = nn.Linear(in_size, 50)
-        self.fc3 = nn.Linear(50, 50)
-        self.fc2 = nn.Linear(50, out_size)
+        self.fc1 = nn.Linear(in_size, 30)
+        self.fc2 = nn.Linear(30, 30)
+        self.fc3 = nn.Linear(30, out_size)
     
     def forward(self, x):
         x = self.fc1(x)
-        x = torch.tanh(x)
-        x = self.fc3(x)
-        x = torch.tanh(x)
+        x = nn.functional.relu(x)
         x = self.fc2(x)
+        x = nn.functional.relu(x)
+        x = self.fc3(x)
         return x
 
-def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
+class Net2(nn.Module):
+    def __init__(self, in_size, out_size):
+        super(Net2, self).__init__()
+        self.fc1 = nn.Linear(in_size, 30)
+        self.fc2 = nn.Linear(30, 30)
+        self.fc3 = nn.Linear(30, out_size)
+    
+    def forward(self, x):
+        x = self.fc1(x)
+        x = nn.functional.relu(x)
+        x = self.fc2(x)
+        x = nn.functional.relu(x)
+        x = self.fc3(x)
+        return x
+
+def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta_train_loop_iterations=20000):
     NUM_PARAMS = f_NEIM.shape[0]
     RO_DIM = ro_sols.shape[1] // 3
     
-    WEIGHTS = np.array([[(abs(i - j) <= 1)/(1+10000*abs(i-j)**2) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
+    #WEIGHTS = np.array([[(abs(i - j) <= 10)/(1+abs(i-j)**2) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
+    #WEIGHTS = np.array([[(abs(i - j) <= 10)/(1+10000*abs(i-j)**2) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
     #WEIGHTS = np.array([[np.exp(-100*np.abs(mu[i] - mu[j])) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
     #WEIGHTS = np.array([[(i == j)*1.0 for j in range(mu.shape[0])] for i in range(mu.shape[0])])
+    #WEIGHTS = np.ones((mu.shape[0], mu.shape[0]))
+    WEIGHTS = np.zeros((mu.shape[0], mu.shape[0]))
+    max_time = np.max(mu[:, 0])
+    for i in range(mu.shape[0]):
+        time_i = int(mu[i, 0] + 0.5)
+        for j in range(mu.shape[0]):
+            if i - j >= 0 and i - j <= time_i:
+                WEIGHTS[i, j] = 1
+            elif i - j <= 0 and j - i <= max_time - time_i:
+                WEIGHTS[i, j] = 1
     
     selected_indices = []
     trained_networks = []
     
     # NEIM Step 1
     errors = np.array([np.sum(f_NEIM[i, i]**2) for i in range(NUM_PARAMS)])
+    #errors[:200] = -1
+    #errors[400:] = -1
     idx = np.argmax(errors)
     selected_indices.append(idx)
     print(idx, "Max Error:", errors[idx], "Mean Error:", np.mean(errors))
@@ -87,6 +116,8 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
         errors = np.array([np.sum((f_NEIM[i, i] - approx(ro_sols[i], i))**2) for i in range(NUM_PARAMS)])
         print("Mean Already Selected Error:", np.mean(errors[np.array(selected_indices)]))
         errors[np.array(selected_indices)] = -1
+        #errors[:200] = -1
+        #errors[400:] = -1
         mu_2_idx = np.argmax(errors)
         selected_indices.append(mu_2_idx)
         print(mu_2_idx, "Max Error:", errors[mu_2_idx], "Mean Error:", np.mean(errors[errors>=0]))
@@ -103,7 +134,7 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
         
         for net in trained_networks:
             # form matrix of evaluations for this network
-            previous_net_matrix = np.zeros((NUM_PARAMS, f_NEIM.shape[2]))#, dtype=np.double)
+            previous_net_matrix = np.zeros((NUM_PARAMS, f_NEIM.shape[2]))
             for i in range(NUM_PARAMS):
                 previous_net_matrix[i] = net(x_data[i].view(1, -1)).detach().numpy().reshape(-1)
                 y_data[i] -= np.dot(y_data[i], previous_net_matrix[i]) * previous_net_matrix[i] / np.linalg.norm(previous_net_matrix[i])**2
@@ -111,7 +142,7 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
         for j in range(f_NEIM.shape[1]):
              y_data[j] = y_data[j] / np.linalg.norm(y_data[j])
         
-        y_data = torch.tensor(y_data).float()#, dtype=torch.double)
+        y_data = torch.tensor(y_data).float()
         
         for epoch in range(train_loop_iterations):
             optimizer.zero_grad()
@@ -143,34 +174,75 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
 
             thetas[i] = np.linalg.solve(LHS, RHS).reshape(-1)
         
+    # train neural network to predict thetas
+    theta_net = Net2(mu.shape[1], num_nets)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(theta_net.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.9)
+
+    mu_mean = np.mean(mu, axis=0, keepdims=True)
+    mu_std = np.std(mu, axis=0, keepdims=True)
+    mu_std[mu_std == 0] = 1
+    #print(mu_mean, mu_std)
+    #print((mu - mu_mean) / mu_std)
+    #print(thetas)
+    
+    x_data = torch.tensor((mu - mu_mean) / mu_std).float()
+    y_data = torch.tensor(thetas).float()
+
+    for epoch in range(theta_train_loop_iterations):
+        optimizer.zero_grad()
+        output = theta_net(x_data)
+        loss = criterion(output, y_data)
+        if epoch % 100 == 0:
+            print(epoch, loss.item())
+        loss.backward()
+        optimizer.step()
+        scheduler.step(loss)
+
+    theta_net.eval()
+        
+        
     def NEIM_approximation(new_mu, new_sol, num_modes=-1):
         if num_modes == -1:
             num_modes = len(trained_networks)
         
+        new_mu = torch.tensor((new_mu.reshape(1,-1) - mu_mean) / mu_std).float()
         new_sol = torch.tensor(new_sol)
-        thetas_ = interpolate.griddata(mu, thetas, new_mu, method='linear').reshape(-1)
-        if True in np.isnan(thetas_):
-            thetas_ = interpolate.griddata(mu, thetas, new_mu, method='nearest').reshape(-1)
+        thetas_ = theta_net(new_mu).view(-1).detach().numpy()
         s = 0
         for i, net in enumerate(trained_networks[:num_modes]):
             s += thetas_[i] * net(new_sol.view(1, -1).float()).view(-1).detach().numpy()
+        
         return s.reshape(-1)
     
     return NEIM_approximation, selected_indices, trained_networks, mu, thetas
 
-def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
+def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta_train_loop_iterations=20000):
     NUM_PARAMS = f_NEIM.shape[0]
     RO_DIM = ro_sols.shape[1] // 4
     
-    WEIGHTS = np.array([[(abs(i - j) <= 1)/(1+10000*abs(i-j)**2) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
+    #WEIGHTS = np.array([[(abs(i - j) <= 10)/(1+abs(i-j)**2) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
+    #WEIGHTS = np.array([[(abs(i - j) <= 10)/(1+10000*abs(i-j)**2) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
     #WEIGHTS = np.array([[np.exp(-100*np.abs(mu[i] - mu[j])) for j in range(mu.shape[0])] for i in range(mu.shape[0])])
     #WEIGHTS = np.array([[(i == j)*1.0 for j in range(mu.shape[0])] for i in range(mu.shape[0])])
+    WEIGHTS = np.zeros((mu.shape[0], mu.shape[0]))
+    max_time = np.max(mu[:, 0])
+    for i in range(mu.shape[0]):
+        time_i = int(mu[i, 0] + 0.5)
+        for j in range(mu.shape[0]):
+            if i - j >= 0 and i - j <= time_i:
+                WEIGHTS[i, j] = 1
+            elif i - j <= 0 and j - i <= max_time - time_i:
+                WEIGHTS[i, j] = 1
     
     selected_indices = []
     trained_networks = []
     
     # NEIM Step 1
     errors = np.array([np.sum(f_NEIM[i, i]**2) for i in range(NUM_PARAMS)])
+    #errors[:200] = -1
+    #errors[400:] = -1
     idx = np.argmax(errors)
     selected_indices.append(idx)
     print(idx, "Max Error:", errors[idx], "Mean Error:", np.mean(errors))
@@ -220,6 +292,8 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
         errors = np.array([np.sum((f_NEIM[i, i] - approx(ro_sols[i], i))**2) for i in range(NUM_PARAMS)])
         print("Mean Already Selected Error:", np.mean(errors[np.array(selected_indices)]))
         errors[np.array(selected_indices)] = -1
+        #errors[:200] = -1
+        #errors[400:] = -1
         mu_2_idx = np.argmax(errors)
         selected_indices.append(mu_2_idx)
         print(mu_2_idx, "Max Error:", errors[mu_2_idx], "Mean Error:", np.mean(errors[errors>=0]))
@@ -276,22 +350,48 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000):
 
             thetas[i] = np.linalg.solve(LHS, RHS).reshape(-1)
         
+    # train neural network to predict thetas
+    theta_net = Net2(mu.shape[1], num_nets)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(theta_net.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.9)
+    
+    mu_mean = np.mean(mu, axis=0, keepdims=True)
+    mu_std = np.std(mu, axis=0, keepdims=True)
+    mu_std[mu_std == 0] = 1
+    
+    x_data = torch.tensor((mu - mu_mean) / mu_std).float()
+    y_data = torch.tensor(thetas).float()
+
+    for epoch in range(theta_train_loop_iterations):
+        optimizer.zero_grad()
+        output = theta_net(x_data)
+        loss = criterion(output, y_data)
+        if epoch % 100 == 0:
+            print(epoch, loss.item())
+        loss.backward()
+        optimizer.step()
+        scheduler.step(loss)
+
+    theta_net.eval()
+        
+        
     def NEIM_approximation(new_mu, new_sol, num_modes=-1):
         if num_modes == -1:
             num_modes = len(trained_networks)
         
+        new_mu = torch.tensor((new_mu.reshape(1,-1) - mu_mean) / mu_std).float()
         new_sol = torch.tensor(new_sol)
-        thetas_ = interpolate.griddata(mu, thetas, new_mu, method='linear').reshape(-1)
-        if True in np.isnan(thetas_):
-            thetas_ = interpolate.griddata(mu, thetas, new_mu, method='nearest').reshape(-1)
+        thetas_ = theta_net(new_mu).view(-1).detach().numpy()
         s = 0
         for i, net in enumerate(trained_networks[:num_modes]):
             s += thetas_[i] * net(new_sol.view(1, -1).float()).view(-1).detach().numpy()
+        
         return s.reshape(-1)
     
     return NEIM_approximation, selected_indices, trained_networks, mu, thetas
 
-def initialize_Q_flow_NEIM(Q1, Q2, p1, p2, r, U_Q1, U_Q2, U_r, nQ_indices, nR_indices):
+def initialize_Q_flow_NEIM(Q1, Q2, r, U_Q1, U_Q2, U_r):
     """
     Initialize variables for POD FEM based on
     initial values of variables for vanilla FEM
@@ -310,22 +410,20 @@ def initialize_Q_flow_NEIM(Q1, Q2, p1, p2, r, U_Q1, U_Q2, U_r, nQ_indices, nR_in
     
     return Q1_, Q2_, r_
 
-def solve_Q_flow_linear_system_NEIM(Q1, Q2, r, LHS, RHS):
+def solve_Q_flow_linear_system_NEIM(Q1, Q2, r, LHS, RHS, NQ_NEIM, time, a, b, c):
     """
     returns: Q1[time], Q2[time]
     """
-
-    g1 = M * U_deimQ1 @ (gamma[nQ_indices] * p1_Q * (U_r[nQ_indices] @ r))
-    g2 = M * U_deimQ2 @ (gamma[nQ_indices] * p2_Q * (U_r[nQ_indices] @ r))
-    g = RHS @ np.concatenate((Q1.reshape(-1, 1), Q2.reshape(-1, 1)), axis=0) - np.concatenate((g1, g2), axis=0)
-
+    ro_sol = np.concatenate([Q1, Q2, r])
+    nonlinearityQ = NQ_NEIM(np.array([time, a]), ro_sol).reshape(-1, 1)#NQ_NEIM(np.array([time, a, b, c]), ro_sol).reshape(-1, 1)
+    g = RHS @ np.concatenate((Q1.reshape(-1, 1), Q2.reshape(-1, 1)), axis=0) - nonlinearityQ
     Q_ = np.linalg.solve(LHS, g).reshape(-1)
 
     return Q_
 
-def solve_Q_flow_NEIM(Q1, Q2, p1_Q, p2_Q, p1_R, p2_R, r, 
+def solve_Q_flow_NEIM(Q1, Q2, r, 
                       gamma, stiffness_matrix, 
-                      U_Q1, U_Q2, U_r,
+                      U_Q1, U_Q2, NQ_NEIM, NR_NEIM,
                       Nt, a, b, c, A0, M, L, dt):
 
     Q1_dim = Q1.shape[1]
@@ -344,9 +442,11 @@ def solve_Q_flow_NEIM(Q1, Q2, p1_Q, p2_Q, p1_R, p2_R, r,
     for time in tqdm(range(1, Nt), position=0, leave=True):
 
         # update Q1, Q2
-        Q_ = solve_Q_flow_linear_system_NEIM(Q1[time-1], Q2[time-1], r[time-1].reshape(-1, 1), LHS, RHS)
+        Q_ = solve_Q_flow_linear_system_NEIM(Q1[time-1], Q2[time-1], r[time-1], LHS, RHS, NQ_NEIM,
+                                             time, a, b, c)
         Q1[time] = Q_[:Q1_dim]
         Q2[time] = Q_[Q1_dim:]
 
         # update r
-        r[time] = r[time-1] + # TODO
+        ro_sol = np.concatenate([Q1[time], Q1[time-1], Q2[time], Q2[time-1]])
+        r[time] = r[time-1] + NR_NEIM(np.array([time-1, a]), ro_sol)#NR_NEIM(np.array([time-1, a, b, c]), ro_sol)
