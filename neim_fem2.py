@@ -15,14 +15,14 @@ class Net(nn.Module):
     def __init__(self, in_size, out_size):
         super(Net, self).__init__()
         self.fc1 = nn.Linear(in_size, 30)
-        self.fc2 = nn.Linear(30, 30)
+        #self.fc2 = nn.Linear(30, 30)
         self.fc3 = nn.Linear(30, out_size)
     
     def forward(self, x):
         x = self.fc1(x)
         x = nn.functional.relu(x)
-        x = self.fc2(x)
-        x = nn.functional.relu(x)
+        #x = self.fc2(x)
+        #x = nn.functional.relu(x)
         x = self.fc3(x)
         return x
 
@@ -53,20 +53,19 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     WEIGHTS = np.zeros((mu.shape[0], mu.shape[0]))
     max_time = np.max(mu[:, 0])
     for i in range(mu.shape[0]):
-        time_i = int(mu[i, 0] + 0.5)
+        a_i = mu[i, 1]
         for j in range(mu.shape[0]):
-            if i - j >= 0 and i - j <= time_i:
+            a_j = mu[j, 1]
+            if abs(a_i - a_j) < 1e-6 and abs(i-j) <= 5:
                 WEIGHTS[i, j] = 1
-            elif i - j <= 0 and j - i <= max_time - time_i:
-                WEIGHTS[i, j] = 1
+    #WEIGHTS = np.ones((mu.shape[0], mu.shape[0]))
     
     selected_indices = []
     trained_networks = []
+    normalizations = []
     
     # NEIM Step 1
     errors = np.array([np.sum(f_NEIM[i, i]**2) for i in range(NUM_PARAMS)])
-    #errors[:200] = -1
-    #errors[400:] = -1
     idx = np.argmax(errors)
     selected_indices.append(idx)
     print(idx, "Max Error:", errors[idx], "Mean Error:", np.mean(errors))
@@ -76,8 +75,17 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     optimizer = torch.optim.Adam(Network_mu_1.parameters(), lr=0.001)    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.9)
     
-    x_data = torch.tensor(ro_sols).float()
-    y_data = torch.tensor(np.array([f_NEIM[idx, j]/np.linalg.norm(f_NEIM[idx, j]) for j in range(f_NEIM.shape[1])])).float()
+    x_mean = np.mean(ro_sols, axis=0, keepdims=True)
+    x_std  = np.std(ro_sols, axis=0, keepdims=True)
+    x_std[x_std == 0] = 1
+    x_data = torch.tensor((ro_sols - x_mean) / x_std).float()
+    
+    y_data = np.array([f_NEIM[idx, j]/np.linalg.norm(f_NEIM[idx, j]) for j in range(f_NEIM.shape[1])])
+    y_mean = np.mean(y_data, axis=0)
+    y_std = np.std(y_data, axis=0)
+    y_std[y_std == 0] = 1
+    y_data = torch.tensor((y_data - y_mean) / y_std).float()
+    normalizations.append((y_mean, y_std))
     
     for epoch in range(train_loop_iterations):
         optimizer.zero_grad()
@@ -92,14 +100,15 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     Network_mu_1.eval()
     trained_networks.append(Network_mu_1)
     
-    thetas = np.zeros((NUM_PARAMS, 1))#, dtype=np.double)
+    thetas = np.zeros((NUM_PARAMS, 1))
     for i in range(NUM_PARAMS):
         numerator = 0
         denominator = 0
         for j in range(NUM_PARAMS):
-            net_u_mu = Network_mu_1(x_data[j].view(1, -1)).detach().numpy().reshape(-1)
-            numerator += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], net_u_mu)
-            denominator += WEIGHTS[i, j] * np.dot(net_u_mu, net_u_mu)
+            if i == j:
+                net_u_mu = (Network_mu_1(x_data[j].view(1, -1)).detach().numpy().reshape(1, -1) * y_std + y_mean).reshape(-1)
+                numerator += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], net_u_mu)
+                denominator += WEIGHTS[i, j] * np.dot(net_u_mu, net_u_mu)
 
         theta_1_1_i = numerator / denominator
         thetas[i] = theta_1_1_i    
@@ -107,7 +116,7 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     for iteration in range(max_modes-1):
         # current approximation
         approx = lambda sol, param_idx: sum([
-            thetas[param_idx][i] * net(torch.tensor(sol).view(1, -1).float()).T.detach().numpy().reshape(-1)\
+            thetas[param_idx][i] * (net(torch.tensor((sol.reshape(1,-1) - x_mean) / x_std).float()).T.detach().numpy().reshape(1,-1) * normalizations[i][1] + normalizations[i][0]).reshape(-1)\
             for i, net in enumerate(trained_networks)
         ])
     
@@ -116,8 +125,6 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
         errors = np.array([np.sum((f_NEIM[i, i] - approx(ro_sols[i], i))**2) for i in range(NUM_PARAMS)])
         print("Mean Already Selected Error:", np.mean(errors[np.array(selected_indices)]))
         errors[np.array(selected_indices)] = -1
-        #errors[:200] = -1
-        #errors[400:] = -1
         mu_2_idx = np.argmax(errors)
         selected_indices.append(mu_2_idx)
         print(mu_2_idx, "Max Error:", errors[mu_2_idx], "Mean Error:", np.mean(errors[errors>=0]))
@@ -132,17 +139,21 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
         previous_y_data = np.copy(y_data)
         y_data = np.copy(f_NEIM[mu_2_idx])
         
-        for net in trained_networks:
+        for net_idx, net in enumerate(trained_networks):
             # form matrix of evaluations for this network
             previous_net_matrix = np.zeros((NUM_PARAMS, f_NEIM.shape[2]))
             for i in range(NUM_PARAMS):
-                previous_net_matrix[i] = net(x_data[i].view(1, -1)).detach().numpy().reshape(-1)
+                previous_net_matrix[i] = (net(x_data[i].view(1, -1)).detach().numpy().reshape(1,-1) * normalizations[net_idx][1] + normalizations[net_idx][0]).reshape(-1)
                 y_data[i] -= np.dot(y_data[i], previous_net_matrix[i]) * previous_net_matrix[i] / np.linalg.norm(previous_net_matrix[i])**2
         
         for j in range(f_NEIM.shape[1]):
              y_data[j] = y_data[j] / np.linalg.norm(y_data[j])
         
-        y_data = torch.tensor(y_data).float()
+        y_mean = np.mean(y_data, axis=0)
+        y_std = np.std(y_data, axis=0)
+        y_std[y_std == 0] = 1
+        y_data = torch.tensor((y_data - y_mean) / y_std).float()
+        normalizations.append((y_mean, y_std))
         
         for epoch in range(train_loop_iterations):
             optimizer.zero_grad()
@@ -160,17 +171,18 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
         # 3c. Find theta_1_2(mu), theta_2_2(mu)
         print("\nFinding theta...")
         num_nets = len(trained_networks)
-        thetas = np.zeros((NUM_PARAMS, num_nets))#, dtype=np.double)
+        thetas = np.zeros((NUM_PARAMS, num_nets))
         for i in range(NUM_PARAMS):
-            LHS = np.zeros((num_nets, num_nets))#, dtype=np.double)
-            RHS = np.zeros((num_nets, 1))#, dtype=np.double)
+            LHS = np.zeros((num_nets, num_nets))
+            RHS = np.zeros((num_nets, 1))
 
             for j in range(NUM_PARAMS):
-                nets_u_mu = [net(x_data[j].view(1, -1)).detach().numpy().reshape(-1) for net in trained_networks]
-                for k1 in range(num_nets):
-                    RHS[k1] += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], nets_u_mu[k1])
-                    for k2 in range(num_nets):
-                        LHS[k1, k2] += WEIGHTS[i, j] * np.dot(nets_u_mu[k1], nets_u_mu[k2])
+                if i == j:
+                    nets_u_mu = [(net(x_data[j].view(1, -1)).detach().numpy().reshape(1,-1) * normalizations[idx][1] + normalizations[idx][0]).reshape(-1) for idx, net in enumerate(trained_networks)]
+                    for k1 in range(num_nets):
+                        RHS[k1] += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], nets_u_mu[k1])
+                        for k2 in range(num_nets):
+                            LHS[k1, k2] += WEIGHTS[i, j] * np.dot(nets_u_mu[k1], nets_u_mu[k2])
 
             thetas[i] = np.linalg.solve(LHS, RHS).reshape(-1)
         
@@ -183,9 +195,6 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     mu_mean = np.mean(mu, axis=0, keepdims=True)
     mu_std = np.std(mu, axis=0, keepdims=True)
     mu_std[mu_std == 0] = 1
-    #print(mu_mean, mu_std)
-    #print((mu - mu_mean) / mu_std)
-    #print(thetas)
     
     x_data = torch.tensor((mu - mu_mean) / mu_std).float()
     y_data = torch.tensor(thetas).float()
@@ -208,11 +217,11 @@ def NEIM_Q(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
             num_modes = len(trained_networks)
         
         new_mu = torch.tensor((new_mu.reshape(1,-1) - mu_mean) / mu_std).float()
-        new_sol = torch.tensor(new_sol)
+        new_sol = torch.tensor((new_sol.reshape(1,-1) - x_mean) / x_std)
         thetas_ = theta_net(new_mu).view(-1).detach().numpy()
         s = 0
         for i, net in enumerate(trained_networks[:num_modes]):
-            s += thetas_[i] * net(new_sol.view(1, -1).float()).view(-1).detach().numpy()
+            s += thetas_[i] * (net(new_sol.view(1, -1).float()).view(1,-1).detach().numpy() * normalizations[i][1] + normalizations[i][0]).reshape(-1)
         
         return s.reshape(-1)
     
@@ -229,20 +238,19 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     WEIGHTS = np.zeros((mu.shape[0], mu.shape[0]))
     max_time = np.max(mu[:, 0])
     for i in range(mu.shape[0]):
-        time_i = int(mu[i, 0] + 0.5)
+        a_i = mu[i, 1]
         for j in range(mu.shape[0]):
-            if i - j >= 0 and i - j <= time_i:
+            a_j = mu[j, 1]
+            if abs(a_i - a_j) < 1e-6 and abs(i-j) <= 5: # a_i - a_j was <= 0.1
                 WEIGHTS[i, j] = 1
-            elif i - j <= 0 and j - i <= max_time - time_i:
-                WEIGHTS[i, j] = 1
+    #WEIGHTS = np.ones((mu.shape[0], mu.shape[0]))
     
     selected_indices = []
     trained_networks = []
+    normalizations = []
     
     # NEIM Step 1
     errors = np.array([np.sum(f_NEIM[i, i]**2) for i in range(NUM_PARAMS)])
-    #errors[:200] = -1
-    #errors[400:] = -1
     idx = np.argmax(errors)
     selected_indices.append(idx)
     print(idx, "Max Error:", errors[idx], "Mean Error:", np.mean(errors))
@@ -252,8 +260,17 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     optimizer = torch.optim.Adam(Network_mu_1.parameters(), lr=0.001)    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.9)
     
-    x_data = torch.tensor(ro_sols).float()
-    y_data = torch.tensor(np.array([f_NEIM[idx, j]/np.linalg.norm(f_NEIM[idx, j]) for j in range(f_NEIM.shape[1])])).float()
+    x_mean = np.mean(ro_sols, axis=0, keepdims=True)
+    x_std  = np.std(ro_sols, axis=0, keepdims=True)
+    x_std[x_std == 0] = 1
+    x_data = torch.tensor((ro_sols - x_mean) / x_std).float()
+    
+    y_data = np.array([f_NEIM[idx, j]/np.linalg.norm(f_NEIM[idx, j]) for j in range(f_NEIM.shape[1])])
+    y_mean = np.mean(y_data, axis=0)
+    y_std = np.std(y_data, axis=0)
+    y_std[y_std == 0] = 1
+    y_data = torch.tensor((y_data - y_mean) / y_std).float()
+    normalizations.append((y_mean, y_std))
     
     for epoch in range(train_loop_iterations):
         optimizer.zero_grad()
@@ -268,14 +285,15 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     Network_mu_1.eval()
     trained_networks.append(Network_mu_1)
     
-    thetas = np.zeros((NUM_PARAMS, 1))#, dtype=np.double)
+    thetas = np.zeros((NUM_PARAMS, 1))
     for i in range(NUM_PARAMS):
         numerator = 0
         denominator = 0
         for j in range(NUM_PARAMS):
-            net_u_mu = Network_mu_1(x_data[j].view(1, -1)).detach().numpy().reshape(-1)
-            numerator += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], net_u_mu)
-            denominator += WEIGHTS[i, j] * np.dot(net_u_mu, net_u_mu)
+            if i == j:
+                net_u_mu = (Network_mu_1(x_data[j].view(1, -1)).detach().numpy().reshape(1, -1) * y_std + y_mean).reshape(-1)
+                numerator += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], net_u_mu)
+                denominator += WEIGHTS[i, j] * np.dot(net_u_mu, net_u_mu)
 
         theta_1_1_i = numerator / denominator
         thetas[i] = theta_1_1_i    
@@ -283,7 +301,7 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
     for iteration in range(max_modes-1):
         # current approximation
         approx = lambda sol, param_idx: sum([
-            thetas[param_idx][i] * net(torch.tensor(sol).view(1, -1).float()).T.detach().numpy().reshape(-1)\
+            thetas[param_idx][i] * (net(torch.tensor((sol.reshape(1,-1) - x_mean) / x_std).float()).T.detach().numpy().reshape(1,-1) * normalizations[i][1] + normalizations[i][0]).reshape(-1)\
             for i, net in enumerate(trained_networks)
         ])
     
@@ -292,8 +310,6 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
         errors = np.array([np.sum((f_NEIM[i, i] - approx(ro_sols[i], i))**2) for i in range(NUM_PARAMS)])
         print("Mean Already Selected Error:", np.mean(errors[np.array(selected_indices)]))
         errors[np.array(selected_indices)] = -1
-        #errors[:200] = -1
-        #errors[400:] = -1
         mu_2_idx = np.argmax(errors)
         selected_indices.append(mu_2_idx)
         print(mu_2_idx, "Max Error:", errors[mu_2_idx], "Mean Error:", np.mean(errors[errors>=0]))
@@ -308,17 +324,21 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
         previous_y_data = np.copy(y_data)
         y_data = np.copy(f_NEIM[mu_2_idx])
         
-        for net in trained_networks:
+        for net_idx, net in enumerate(trained_networks):
             # form matrix of evaluations for this network
-            previous_net_matrix = np.zeros((NUM_PARAMS, f_NEIM.shape[2]))#, dtype=np.double)
+            previous_net_matrix = np.zeros((NUM_PARAMS, f_NEIM.shape[2]))
             for i in range(NUM_PARAMS):
-                previous_net_matrix[i] = net(x_data[i].view(1, -1)).detach().numpy().reshape(-1)
+                previous_net_matrix[i] = (net(x_data[i].view(1, -1)).detach().numpy().reshape(1,-1) * normalizations[net_idx][1] + normalizations[net_idx][0]).reshape(-1)
                 y_data[i] -= np.dot(y_data[i], previous_net_matrix[i]) * previous_net_matrix[i] / np.linalg.norm(previous_net_matrix[i])**2
         
         for j in range(f_NEIM.shape[1]):
              y_data[j] = y_data[j] / np.linalg.norm(y_data[j])
         
-        y_data = torch.tensor(y_data).float()#, dtype=torch.double)
+        y_mean = np.mean(y_data, axis=0)
+        y_std = np.std(y_data, axis=0)
+        y_std[y_std == 0] = 1
+        y_data = torch.tensor((y_data - y_mean) / y_std).float()
+        normalizations.append((y_mean, y_std))
         
         for epoch in range(train_loop_iterations):
             optimizer.zero_grad()
@@ -336,17 +356,18 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
         # 3c. Find theta_1_2(mu), theta_2_2(mu)
         print("\nFinding theta...")
         num_nets = len(trained_networks)
-        thetas = np.zeros((NUM_PARAMS, num_nets))#, dtype=np.double)
+        thetas = np.zeros((NUM_PARAMS, num_nets))
         for i in range(NUM_PARAMS):
-            LHS = np.zeros((num_nets, num_nets))#, dtype=np.double)
-            RHS = np.zeros((num_nets, 1))#, dtype=np.double)
+            LHS = np.zeros((num_nets, num_nets))
+            RHS = np.zeros((num_nets, 1))
 
             for j in range(NUM_PARAMS):
-                nets_u_mu = [net(x_data[j].view(1, -1)).detach().numpy().reshape(-1) for net in trained_networks]
-                for k1 in range(num_nets):
-                    RHS[k1] += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], nets_u_mu[k1])
-                    for k2 in range(num_nets):
-                        LHS[k1, k2] += WEIGHTS[i, j] * np.dot(nets_u_mu[k1], nets_u_mu[k2])
+                if i == j:
+                    nets_u_mu = [(net(x_data[j].view(1, -1)).detach().numpy().reshape(1,-1) * normalizations[idx][1] + normalizations[idx][0]).reshape(-1) for idx, net in enumerate(trained_networks)]
+                    for k1 in range(num_nets):
+                        RHS[k1] += WEIGHTS[i, j] * np.dot(f_NEIM[i, j], nets_u_mu[k1])
+                        for k2 in range(num_nets):
+                            LHS[k1, k2] += WEIGHTS[i, j] * np.dot(nets_u_mu[k1], nets_u_mu[k2])
 
             thetas[i] = np.linalg.solve(LHS, RHS).reshape(-1)
         
@@ -381,11 +402,11 @@ def NEIM_R(ro_sols, f_NEIM, mu, max_modes=10, train_loop_iterations=10000, theta
             num_modes = len(trained_networks)
         
         new_mu = torch.tensor((new_mu.reshape(1,-1) - mu_mean) / mu_std).float()
-        new_sol = torch.tensor(new_sol)
+        new_sol = torch.tensor((new_sol.reshape(1,-1) - x_mean) / x_std)
         thetas_ = theta_net(new_mu).view(-1).detach().numpy()
         s = 0
         for i, net in enumerate(trained_networks[:num_modes]):
-            s += thetas_[i] * net(new_sol.view(1, -1).float()).view(-1).detach().numpy()
+            s += thetas_[i] * (net(new_sol.view(1, -1).float()).view(1,-1).detach().numpy() * normalizations[i][1] + normalizations[i][0]).reshape(-1)
         
         return s.reshape(-1)
     

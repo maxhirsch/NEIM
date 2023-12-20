@@ -28,7 +28,7 @@ M = 1
 L1 = 0.1
 
 # number of time steps and final time
-Nt = 80
+Nt = 30#80
 t_final = 4
 tVals = np.linspace(0, t_final, Nt)
 dt = tVals[1] - tVals[0] # delta t
