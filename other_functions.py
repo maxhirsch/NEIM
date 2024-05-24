@@ -75,15 +75,18 @@ def get_n0(x, y, ic=1):
         #n0 = (2-x)*(x+2)*(2-y)*(y+2) / 8
         #n1 = np.sin(np.pi*x)*np.sin(np.pi*y)
 
-        n0 = (2-x)**2*(x+2)*(2-y)*(y+2)**2 / 50
+        n0 = (2-x)*(2+x)*(2-y)*(2+y)#(2-x)**2*(x+2)*(2-y)*(y+2)**2 / 50
         n1 = np.sin(np.pi*x)*np.sin(np.pi*y)
     else:
         raise ValueError("Invalid initial condition")
+    
+    n0 = n0 / np.sqrt(1 + n0**2 + n1**2)
+    n1 = n1 / np.sqrt(1 + n0**2 + n1**2)
 
     return np.array([[n0], [n1]])
 
 def get_Q0(n0):
-    return n0 @ n0.T - np.sum(n0*n0)/2.0 * np.eye(2) # this is actually just n0 @ n0.T - 1/2 I
+    return n0 @ n0.T - np.sum(n0*n0)/2.0 * np.eye(2)
 
 
 def initialize_Q_flow(interior_point_coords, Nt, a, b, c, A0):
